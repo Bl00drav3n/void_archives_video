@@ -62,6 +62,14 @@ struct rect_t {
     int Height;
 };
 
+struct image_t {
+    uchar* Pixels;
+    int Width;
+    int Height;
+    int Channels;
+    int Pitch;
+};
+
 static void LOGMSG(const char* fmt, ...) {
     static FILE* LogFile = fopen("Log.txt", "w");
     if (LogFile) {
@@ -153,39 +161,59 @@ static void draw_indicator(uchar *Pixels, int Width, int Height, int x, int y) {
     }
 }
 
-// TODO(rav3n): Provide a function pointer?
-static void invert_image(uchar *Image, int Width, int Height, int Channels, int Stride) {
-    for (int y = 0; y < Height; y++) {
-        uchar* Row = Image + y * Stride;
-        for (int x = 0; x < Width; x++) {
-            for (int Channel = 0; Channel < Channels; Channel++) {
-                uchar* Pixel = Row + Channels * x + Channel;
+static image_t image_from_cvmat(cv::Mat* M) {
+    image_t Result;
+    Result.Width = M->cols;
+    Result.Height = M->rows;
+    Result.Pixels = M->ptr(0, 0);
+    Result.Channels = 3;
+    Result.Pitch = Result.Channels * Result.Width;
+    return Result;
+}
+
+static image_t subimage(const image_t* Src, const rect_t* SubRect) {
+    image_t Result = *Src;
+    if (SubRect) {
+        Result.Pixels = Src->Pixels + Src->Channels * (SubRect->Y * Src->Width + SubRect->X);
+        Result.Width = SubRect->Width;
+        Result.Height = SubRect->Height;
+    }
+
+    return Result;
+}
+
+static void invert_image(image_t* Im) {
+    for (int y = 0; y < Im->Height; y++) {
+        uchar* Row = Im->Pixels + y * Im->Pitch;
+        for (int x = 0; x < Im->Width; x++) {
+            for (int Channel = 0; Channel < Im->Channels; Channel++) {
+                uchar* Pixel = Row + Im->Channels * x + Channel;
                 *Pixel = 255 - *Pixel;
             }
         }
     }
 }
 
-static void change_contrast(uchar* Image, int Width, int Height, int Channels, int Stride, float Contrast) {
-    for (int y = 0; y < Height; y++) {
-        uchar* Row = Image + y * Stride;
-        for (int x = 0; x < Width; x++) {
-            for (int Channel = 0; Channel < Channels; Channel++) {
-                uchar* Pixel = Row + Channels * x + Channel;
-                float Value = Contrast * (Pixel[0] / 255.f - 1.f) + 1.f;
-                *Pixel = clamp((int)((Value + 0.5f) * 255.f), 0x00, 0xff);
-            }
+static void to_grayscale(image_t* Im) {
+    for (int y = 0; y < Im->Height; y++) {
+        uchar* Row = Im->Pixels + y * Im->Pitch;
+        for (int x = 0; x < Im->Width; x++) {
+            uchar* Pixel = Row + Im->Channels * x;
+            uchar Value = clamp((int)(0.299f * Pixel[2] + 0.587f * Pixel[1] + 0.114f * Pixel[0]), 0, 255);
+            Pixel[0] = Pixel[1] = Pixel[2] = Value;
         }
     }
 }
 
-static void to_grayscale(uchar* Image, int Width, int Height, int Channels, int Stride) {
-    for (int y = 0; y < Height; y++) {
-        uchar* Row = Image + y * Stride;
-        for (int x = 0; x < Width; x++) {
-            uchar* Pixel = Row + Channels * x;
-            uchar Value = clamp((int)(0.299f * Pixel[2] + 0.587f * Pixel[1] + 0.114f * Pixel[0]), 0, 255);
-            Pixel[0] = Pixel[1] = Pixel[2] = Value;
+static void change_contrast(image_t* Im, float Contrast) {
+    for (int y = 0; y < Im->Height; y++) {
+        uchar* Row = Im->Pixels + y * Im->Pitch;
+        for (int x = 0; x < Im->Width; x++) {
+            for (int Channel = 0; Channel < Im->Channels; Channel++) {
+                uchar* Pixel = Row + Im->Channels * x + Channel;
+                float Value = Contrast * (Pixel[0] / 255.f - 1.f) + 1.f;
+                *Pixel = clamp((int)((Value + 0.5f) * 255.f), 0x00, 0xff);
+            }
         }
     }
 }
@@ -229,9 +257,7 @@ static void scan_stigmata_screen(state_t* State, cv::Mat* RefFrame) {
     static int StigmataFrameIndex = 0;
     log_timestamp(State->Capture, "Stigmata screen");
 
-    uchar* Image = RefFrame->ptr(0, 0);
-    const int ImageChannels = 3;
-    const int ImageStrideBytes = ImageChannels * State->Width;
+    image_t Image = image_from_cvmat(RefFrame);
 
     const int NameBoxWidth = 484;
     const int NameBoxHeight = 72;
@@ -240,11 +266,11 @@ static void scan_stigmata_screen(state_t* State, cv::Mat* RefFrame) {
     };
     {
         rect_t* Box = &NameBox;
-        uchar* SubImage = Image + ImageChannels * (State->Width * Box->Y + Box->X);
-        change_contrast(SubImage, NameBoxWidth, NameBoxHeight, ImageChannels, ImageStrideBytes, 4.f);
-        invert_image(SubImage, NameBoxWidth, NameBoxHeight, ImageChannels, ImageStrideBytes);
-        to_grayscale(SubImage, NameBoxWidth, NameBoxHeight, ImageChannels, ImageStrideBytes);
-        State->Tess.SetImage(SubImage, NameBoxWidth, NameBoxHeight, ImageChannels, ImageStrideBytes);
+        image_t SubImage = subimage(&Image, Box);
+        change_contrast(&SubImage, 4.f);
+        invert_image(&SubImage);
+        to_grayscale(&SubImage);
+        State->Tess.SetImage(SubImage.Pixels, Box->Width, Box->Height, SubImage.Channels, SubImage.Pitch);
         State->Tess.Recognize(0);
         char* Str = State->Tess.GetUTF8Text();
         std::string Text = trim(replace_char(Str, '\n', ' '));
@@ -264,10 +290,10 @@ static void scan_stigmata_screen(state_t* State, cv::Mat* RefFrame) {
     };
     for (int i = 0; i < 3; i++) {
         rect_t* Box = StigmataBoxes + i;
-        uchar* SubImage = Image + ImageChannels * (State->Width * Box->Y + Box->X);
-        invert_image(SubImage, StigmataBoxWidth, StigmataBoxHeight, ImageChannels, ImageStrideBytes);
-        change_contrast(SubImage, StigmataBoxWidth, StigmataBoxHeight, ImageChannels, ImageStrideBytes, 4.f);
-        State->Tess.SetImage(SubImage, StigmataBoxWidth, StigmataBoxHeight, ImageChannels, ImageStrideBytes);
+        image_t SubImage = subimage(&Image, Box);
+        invert_image(&SubImage);
+        change_contrast(&SubImage, 4.f);
+        State->Tess.SetImage(SubImage.Pixels, Box->Width, Box->Height, SubImage.Channels, SubImage.Pitch);
         State->Tess.Recognize(0);
         char* Str = State->Tess.GetUTF8Text();
         std::string Text = trim(replace_char(Str, '\n', ' '));
@@ -332,6 +358,7 @@ int main(int argc, char* argv[]) {
     State.Width = 1920;
     State.Height = 1080;
     State.HadStigmataScreenIndicator = false;
+    State.HadLineupScreenIndicator = false;
 
     if (State.Tess.Init(".", "eng")) {
         LOGMSG("Could not initialize tesseract\n");
