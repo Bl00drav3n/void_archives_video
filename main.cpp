@@ -326,6 +326,8 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    LOGMSG("Using OpenCV version %s\n", cv::getVersionString());
+
     state_t State;
     State.Width = 1920;
     State.Height = 1080;
